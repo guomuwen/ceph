@@ -37,9 +37,10 @@ class CacheClient {
   int register_client(Context* on_finish);
 
  private:
-  void send_message();
-  void try_send();
-  void fault(const int err_type, const boost::system::error_code& err);
+  void send_message(uint64_t seq = 0);
+  void try_send(uint64_t seq = 0);
+  void fault(const int err_type, const boost::system::error_code& err,
+                          bool *is_stale_write = nullptr);
   void handle_connect(Context* on_finish, const boost::system::error_code& err);
   void try_receive();
   void receive_message();

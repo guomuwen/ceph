@@ -131,21 +131,21 @@ namespace immutable_obj_cache {
     }
 
     // try to send message to server.
-    try_send();
+    try_send(req->seq);
 
     // try to receive ack from server.
     try_receive();
   }
 
-  void CacheClient::try_send() {
+  void CacheClient::try_send(uint64_t seq) {
     ldout(m_cct, 20) << dendl;
     if (!m_writing.load()) {
       m_writing.store(true);
-      send_message();
+      send_message(seq);
     }
   }
 
-  void CacheClient::send_message() {
+  void CacheClient::send_message(uint64_t seq) {
     ldout(m_cct, 20) << dendl;
     bufferlist bl;
     {
@@ -159,8 +159,19 @@ namespace immutable_obj_cache {
         boost::asio::buffer(bl.c_str(), bl.length()),
         boost::asio::transfer_exactly(bl.length()),
         [this, bl](const boost::system::error_code& err, size_t cb) {
+        bool is_stale_write = false;
         if (err || cb != bl.length()) {
-           fault(ASIO_ERROR_WRITE, err);
+           fault(ASIO_ERROR_WRITE, err, &is_stale_write);
+           if (is_stale_write) {
+             if (seq) {
+               std::lock_guard locker{m_lock};
+               auto it = m_seq_to_req.find(seq);
+               ceph_assert(it != m_seq_to_req.end());
+               it.second->type = RBDSC_STALE_READ;
+               it.second->process_msg->complete(it.second);
+               m_seq_to_req.erase(it);
+             }
+           }
            return;
         }
 
@@ -305,7 +316,8 @@ namespace immutable_obj_cache {
 
   // if there is one request fails, just execute fault, then shutdown RO.
   void CacheClient::fault(const int err_type,
-                          const boost::system::error_code& ec) {
+                          const boost::system::error_code& ec,
+                          bool *is_stale_write) {
     ldout(m_cct, 20) << "fault." << ec.message() << dendl;
 
     if (err_type == ASIO_ERROR_CONNECT) {
@@ -353,9 +365,18 @@ namespace immutable_obj_cache {
     }
 
     if (err_type == ASIO_ERROR_WRITE) {
-       ldout(m_cct, 20) << "ASIO asyn write fails : " << ec.message() << dendl;
-       // CacheClient should not occur this error.
-       ceph_assert(0);
+       ldout(m_cct, 20) << "ASIO asyn write fails : " << ec.message()
+                      << " ec : " << ec << dendl;
+       if (ec == boost::asio::error::broken_pipe) { // 如果错误码是这个，说明是之前建立过连接，但现在服务端重启了，需重建连接
+                    // 并且需要清除m_outcoming_bl和m_set_to_req m_outcomming在send_message时已清除
+                    // 所以只需清除m_set_to_req 因为这个请求本身就不应该存在
+         if (is_stale_write)
+           *is_stale_write = true;
+         return;
+       } else {
+         // CacheClient should not occur this error.
+         ceph_assert(0);
+       }
     }
 
     // currently, for any asio error, just shutdown RO.
